@@ -290,6 +290,28 @@ class Trainer:
 
                 writer.write_out_storage()
 
+            #ARF-TRAINING
+            train_dataset = self.pipeline.datamanager.train_dataset
+            train_cameras = train_dataset.cameras
+            train_cameras_optimizer = self.pipeline.datamanager.train_camera_optimizer
+
+            # Freeze Density
+            # Set the density mlp requires_grad flag to False since we do not need to compute gradients
+
+            # num_images = train_dataset.num_images
+            # image_w, image_h = 
+
+            # i = 0
+            # with torch.no_grad():
+            #     currcam = train_cameras[i]
+            #     # cam_opt = train_cameras_optimizer([i]).squeeze() #Transformation matrices from optimized camera coordinates to given camera coordinates (3, 4).
+            #     # transformed_cam = torch.concat([currcam.camera_to_worlds.cuda(), torch.tensor([[0, 0, 0, 1]]).cuda()], axis=0) @ torch.concat([cam_opt, torch.tensor([[0, 0, 0, 1]]).cuda()], axis=0)
+            #     # currcam.camera_to_worlds = transformed_cam[:3].cpu()
+            #     bundle = currcam.generate_rays(camera_indices=0)
+            #     bundle = bundle.to(self.pipeline.device)
+            #     outputs = self.pipeline.model.get_outputs_for_camera_ray_bundle(bundle)
+
+
         # save checkpoint at the end of training
         self.save_checkpoint(step)
 
