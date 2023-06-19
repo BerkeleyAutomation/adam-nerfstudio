@@ -23,6 +23,7 @@ from typing import List, Literal, Optional, OrderedDict, Tuple, Union
 
 import cv2
 import numpy as np
+import os
 
 from nerfstudio.utils.rich_utils import CONSOLE, status
 from nerfstudio.utils.scripts import run_command
@@ -163,8 +164,31 @@ def convert_video_to_images(
                 ffmpeg_cmd += f" -vf {crop_cmd[1:]}"
 
         ffmpeg_cmd += f" {out_filename}"
+        import pdb; pdb.set_trace()
         run_command(ffmpeg_cmd, verbose=verbose)
 
+    # Post process images to keep only plant ones
+    with status(msg="Converting video to images...", spinner="bouncingBall", verbose=verbose):
+        THRESHOLD = 0.2
+        for i, filename in enumerate(list(image_dir.glob("*.png"))):
+            img = cv2.imread(dir + filename)
+
+            ## convert to hsv
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+            ## mask of green (36,25,25) ~ (86, 255,255)
+            # mask = cv2.inRange(hsv, (36, 25, 25), (86, 255,255))
+            mask = cv2.inRange(hsv, (36, 25, 25), (70, 255,255))
+
+            ## slice the green
+            imask = mask>0
+            green = np.zeros_like(img, np.uint8)
+            green[imask] = img[imask]
+
+            if np.sum(green)/ (green.shape[0] * green.shape[1] * green.shape[2]) < THRESHOLD:
+            # if np.sum(imask)/ (imask.shape[0] * imask.shape[1]) > THRESHOLD:
+                filename.unlink()
+        
     num_final_frames = len(list(image_dir.glob("*.png")))
     summary_log = []
     summary_log.append(f"Starting with {num_frames} video frames")
