@@ -16,6 +16,7 @@
 Code to train model.
 """
 from __future__ import annotations
+from collections import defaultdict
 
 import dataclasses
 import functools
@@ -43,6 +44,24 @@ from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils.writer import EventName, TimeWriter
 from nerfstudio.viewer.server.viewer_state import ViewerState
 from nerfstudio.viewer_beta.viewer import Viewer as ViewerBetaState
+
+
+#ARF IMPORTS
+import os
+from tqdm.auto import tqdm
+import random
+import numpy as np
+import torch.nn.functional as F
+
+import cv2
+import sys
+from nerfstudio.model_components.losses import (
+    # NNLoss, 
+    NNFMLoss,
+    match_colors_for_image_set,
+)
+import imageio
+
 
 TRAIN_INTERATION_OUTPUT = Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
 TORCH_DEVICE = str
@@ -293,23 +312,242 @@ class Trainer:
             #ARF-TRAINING
             train_dataset = self.pipeline.datamanager.train_dataset
             train_cameras = train_dataset.cameras
+            device = self.pipeline.device
+            field = self.pipeline.model.field
+            batch_size = 4096
+            num_images = len(train_cameras)
+            image_h, image_w = train_dataset.get_image(0).shape[:2]
             train_cameras_optimizer = self.pipeline.datamanager.train_camera_optimizer
+            logfolder = "log"
+            os.makedirs(logfolder, exist_ok=True)
 
             # Freeze Density
             # Set the density mlp requires_grad flag to False since we do not need to compute gradients
+            field.mlp_base.requires_grad_(False)
+            for param in field.mlp_base.parameters():
+                param.requires_grad = False
 
-            # num_images = train_dataset.num_images
-            # image_w, image_h = 
+            # Freeze view direction mlp
+            field.freeze_view_direction = True
 
-            # i = 0
-            # with torch.no_grad():
-            #     currcam = train_cameras[i]
-            #     # cam_opt = train_cameras_optimizer([i]).squeeze() #Transformation matrices from optimized camera coordinates to given camera coordinates (3, 4).
-            #     # transformed_cam = torch.concat([currcam.camera_to_worlds.cuda(), torch.tensor([[0, 0, 0, 1]]).cuda()], axis=0) @ torch.concat([cam_opt, torch.tensor([[0, 0, 0, 1]]).cuda()], axis=0)
-            #     # currcam.camera_to_worlds = transformed_cam[:3].cpu()
-            #     bundle = currcam.generate_rays(camera_indices=0)
-            #     bundle = bundle.to(self.pipeline.device)
-            #     outputs = self.pipeline.model.get_outputs_for_camera_ray_bundle(bundle)
+            # nn_loss_fn = NNLoss(device=device)
+            nn_loss_fn = NNFMLoss(device=device)
+
+
+            ###### resize style image such that its long side matches the long side of content images
+            style_file_name = '/home/abrashid/lerf/ARF-svox2/data/styles/131.jpg'
+            style_img = imageio.imread(style_file_name).astype(np.float32) / 255.0
+            style_h, style_w = style_img.shape[:2]
+            content_long_side = max([image_h, image_w])
+            if style_h > style_w:
+                style_img = cv2.resize(
+                    style_img,
+                    (int(content_long_side / style_h * style_w), content_long_side),
+                    interpolation=cv2.INTER_AREA,
+                )
+            else:
+                style_img = cv2.resize(
+                    style_img,
+                    (content_long_side, int(content_long_side / style_w * style_h)),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            style_img = cv2.resize(
+                style_img,
+                (style_img.shape[1] // 2, style_img.shape[0] // 2),
+                interpolation=cv2.INTER_AREA,
+            )  #This is to replace the downsampling in optimization loop
+
+            # imageio.imwrite(
+            #     f'{logfolder}/style_image.png',
+            #     np.clip(style_img * 255.0, 0.0, 255.0).astype(np.uint8),
+            # )
+            style_img = torch.from_numpy(style_img).to(device=device)
+
+
+            # # color transfer input images
+            allrgbs = [] # allrgb - (N, w, h, 3)
+            for i in range(num_images):
+                allrgbs.append(train_dataset.get_image(i))
+            allrgbs = torch.stack(allrgbs, dim=0).to(device=device)
+
+            allrgbs, color_tf = match_colors_for_image_set(allrgbs, style_img.reshape(-1, 3).cpu())
+            allrgbs = allrgbs.view(num_images, image_h, image_w, 3)
+            
+            # imageio.imwrite(f'{logfolder}/color_image.png', np.clip(allrgbs[0].cpu().numpy() * 255.0, 0.0, 255.0).astype(np.uint8))
+
+            #Color transfer train
+            for iteration in tqdm(range(300)):
+                #Get the next ray index
+                #Compute loss between the pixels and the training images
+                ray_bundle, batch = self.pipeline.datamanager.next_train(0)
+                model_outputs = self.pipeline._model(ray_bundle)  # train distributed data parallel model if world_size > 1
+                # rgb_train = allrgbs[batch['indices']].to(device)
+                rgb_train = []
+                for i in range(len(batch['indices'])):
+                    rgb_train.append(allrgbs[batch['indices'][i][0], batch['indices'][i][1], batch['indices'][i][2]])
+                rgb_train = torch.stack(rgb_train, dim=0).to(device=device)
+                rgb_map = model_outputs["rgb"]
+
+                loss = torch.mean((rgb_map - rgb_train) ** 2) #Content loss
+                # loss
+                total_loss = loss
+
+                self.optimizers.zero_grad_all()
+                total_loss.backward()
+                self.optimizers.optimizer_step_all()
+                
+
+            #Style Transfer Train
+            pbar = tqdm(range(600), file=sys.stdout)
+            for iteration in pbar:
+                # Randomly select one image
+                img_i = np.random.choice(num_images)
+                rgb_train = allrgbs.view(num_images, image_h, image_w, 3)[img_i].view(-1, 3)
+                rgb_gt = rgb_train.view(image_h, image_w, 3).permute(2, 0, 1).unsqueeze(0).contiguous().to(device)
+                currcam = train_cameras[img_i]
+                camera_ray_bundle = currcam.generate_rays(camera_indices=0).to(self.pipeline.device)
+
+                def compute_image_loss():
+                    with torch.no_grad():
+                        num_rays_per_chunk = 4096
+                        rgb_pred = []
+                        for i in range(0, len(camera_ray_bundle), num_rays_per_chunk):
+                            start_idx = i
+                            end_idx = i + num_rays_per_chunk
+                            ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+                            outputs = self.pipeline._model.forward(ray_bundle=ray_bundle)
+                            rgb_out_batch = outputs["rgb"]
+                            rgb_pred.append(rgb_out_batch)
+                        
+                        rgb_pred = torch.cat(rgb_pred, dim=0)
+                        rgb_pred = rgb_pred.view(image_h, image_w, 3).permute(2, 0, 1).unsqueeze(0).contiguous()
+
+                    rgb_pred.requires_grad_(True)
+
+                    imageio.imwrite(f'{logfolder}/out_image_{iteration}.png', np.clip(rgb_pred[0].permute(1,2,0).detach().cpu().numpy() * 255.0, 0.0, 255.0).astype(np.uint8))
+                    imageio.imwrite(f'{logfolder}/style_image_{iteration}.png', np.clip(style_img.cpu().numpy() * 255.0, 0.0, 255.0).astype(np.uint8))
+                    imageio.imwrite(f'{logfolder}/gt_image_{iteration}.png', np.clip(rgb_gt[0].permute(1,2,0).cpu().numpy() * 255.0, 0.0, 255.0).astype(np.uint8))
+
+                    loss_dict = nn_loss_fn(
+                        F.interpolate(
+                            rgb_pred,
+                            size=None,
+                            scale_factor=0.5,
+                            mode="bilinear",
+                        ),
+                        style_img.permute(2, 0, 1).unsqueeze(0),
+                        loss_names=["nnfm_loss", "content_loss", "gram_loss"],
+                        contents=F.interpolate(
+                            rgb_gt,
+                            size=None,
+                            scale_factor=0.5,
+                            mode="bilinear",
+                        ),
+                    )
+                    # print(f"nn_loss: {nn_loss}, gram_loss: {gram_loss}, content_loss: {content_loss}")
+                    print(f"nnfm_loss: {loss_dict['nnfm_loss']}, content_loss: {loss_dict['content_loss']}")
+                    loss_dict["content_loss"] = loss_dict["content_loss"] # was using 5e-3
+                    # loss_dict['gram_loss'] = loss_dict['gram_loss'] * 0.0000001
+                    loss_dict['nnfm_loss'] = 0
+                    loss = functools.reduce(torch.add, loss_dict.values())
+                    print("Loss: ", loss)
+                    loss.backward()
+
+                    rgb_pred_grad = rgb_pred.grad.squeeze(0).permute(1, 2, 0).contiguous().clone().detach().view(-1, 3)
+                    rgb_pred = rgb_pred.squeeze(0).permute(1, 2, 0).contiguous().clone().detach()
+                    print("Rgb pred grad norm: ", torch.norm(rgb_pred_grad))
+                    return rgb_pred, rgb_pred_grad
+          
+                # with torch.no_grad():
+                #     currcam = train_cameras[img_i]
+                #     camera_ray_bundle = currcam.generate_rays(camera_indices=0).to(self.pipeline.device)
+                #     ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(0, len(camera_ray_bundle))
+                #     outputs = self.pipeline._model.forward(ray_bundle=ray_bundle)
+                #     rgb_pred = outputs["rgb"]
+                #     rgb_pred = rgb_pred.permute(2, 0, 1).unsqueeze(0).contiguous().to(device)
+                
+                # rgb_pred.requires_grad_(True)
+                # cpu_or_cuda_str: str = self.device.split(":")[0]
+                # # with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
+                # #     nn_loss, gram_loss, content_loss = nn_loss_fn(
+                # #         F.interpolate(
+                # #             rgb_pred,
+                # #             size=None,
+                # #             scale_factor=0.5,
+                # #             mode="bilinear",
+                # #         ),
+                # #         style_img.permute(2, 0, 1).unsqueeze(0),
+                # #         loss_names=["nn_loss", "gram_loss", "content_loss"],
+                # #         contents=F.interpolate(
+                # #             rgb_gt,
+                # #             size=None,
+                # #             scale_factor=0.5,
+                # #             mode="bilinear",
+                # #         ),
+                # #     )
+                # #     print(f"nn_loss: {nn_loss}, gram_loss: {gram_loss}, content_loss: {content_loss}")
+                # #     content_loss = content_loss * 0.005  # was using 5e-3
+                # #     loss = gram_loss + content_loss # + img_tv_loss
+                # #     loss.backward()
+
+                # # with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
+                # # loss_dict = nn_loss_fn(F.interpolate(rgb_pred,size=None,scale_factor=0.5,mode="bilinear",),style_img.permute(2, 0, 1).unsqueeze(0),loss_names=["nnfm_loss", "content_loss"],contents=F.interpolate(rgb_gt,size=None,scale_factor=0.5,mode="bilinear",),)
+                
+                # os.makedirs(logfolder, exist_ok=True)
+                # imageio.imwrite(f'{logfolder}/out_image_{iteration}.png', np.clip(rgb_pred[0].permute(1,2,0).detach().cpu().numpy() * 255.0, 0.0, 255.0).astype(np.uint8))
+                # imageio.imwrite(f'{logfolder}/style_image_{iteration}.png', np.clip(style_img.cpu().numpy() * 255.0, 0.0, 255.0).astype(np.uint8))
+                # imageio.imwrite(f'{logfolder}/gt_image_{iteration}.png', np.clip(rgb_gt[0].permute(1,2,0).cpu().numpy() * 255.0, 0.0, 255.0).astype(np.uint8))
+                # loss_dict = nn_loss_fn(
+                #     F.interpolate(
+                #         rgb_pred,
+                #         size=None,
+                #         scale_factor=0.5,
+                #         mode="bilinear",
+                #     ),
+                #     style_img.permute(2, 0, 1).unsqueeze(0),
+                #     loss_names=["nnfm_loss", "content_loss"],
+                #     contents=F.interpolate(
+                #         rgb_gt,
+                #         size=None,
+                #         scale_factor=0.5,
+                #         mode="bilinear",
+                #     ),
+                # )
+                # # print(f"nn_loss: {nn_loss}, gram_loss: {gram_loss}, content_loss: {content_loss}")
+                # print(f"nnfm_loss: {loss_dict['nnfm_loss']}, content_loss: {loss_dict['content_loss']}")
+                # loss_dict["content_loss"] = loss_dict["content_loss"] * 0.005 # was using 5e-3
+                # # loss_dict['gram_loss'] = loss_dict['gram_loss'] * 0.0000001
+                # # loss_dict['nnfm_loss'] = 0
+                # loss = functools.reduce(torch.add, loss_dict.values())
+                # print("Loss: ", loss)
+                # loss.backward()
+                
+                # # self.grad_scaler.scale(loss).backward()  # type: ignore
+                
+                # rgb_pred_grad = rgb_pred.grad.squeeze(0).permute(1, 2, 0).contiguous().clone().detach().view(-1, 3)
+                # print("Rgb pred grad norm: ", torch.norm(rgb_pred_grad))
+
+                out_rgb_pred, rgb_pred_grad = compute_image_loss()
+                num_rays_per_chunk = 4096
+                num_rays = len(camera_ray_bundle)
+                for i in range(0, num_rays, num_rays_per_chunk):
+                    start_idx = i
+                    end_idx = i + num_rays_per_chunk
+                    ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+                    outputs = self.pipeline._model.forward(ray_bundle=ray_bundle)
+                    rgb_out = outputs["rgb"]
+                    self.optimizers.zero_grad_all()
+                    rgb_out.backward(rgb_pred_grad[start_idx:end_idx])
+                    
+                print("Optimizing")
+                self.optimizers.optimizer_step_all()
+
+                # scale = self.grad_scaler.get_scale()
+                # self.grad_scaler.update()
+                # # If the gradient scaler is decreased, no optimization step is performed so we should not step the scheduler.
+                # if scale <= self.grad_scaler.get_scale():
+                    # self.optimizers.scheduler_step_all(1000000)
 
 
         # save checkpoint at the end of training

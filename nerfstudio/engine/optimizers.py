@@ -123,6 +123,11 @@ class Optimizers:
             grad_scaler: GradScaler to use
         """
         for param_group, optimizer in self.optimizers.items():
+            # for i in range(len(self.parameters[param_group])):
+                # if self.parameters[param_group][i].grad is not None:
+                #     print("Param Group Norm:", param_group, i, torch.norm(self.parameters[param_group][i].grad))
+                # else:
+                #     print("Param Group Norm:", param_group, i, "None")
             max_norm = self.config[param_group]["optimizer"].max_norm
             if max_norm is not None:
                 grad_scaler.unscale_(optimizer)
@@ -133,6 +138,11 @@ class Optimizers:
     def optimizer_step_all(self) -> None:
         """Run step for all optimizers."""
         for param_group, optimizer in self.optimizers.items():
+            # for i in range(len(self.parameters[param_group])):
+            #     if self.parameters[param_group][i].grad is not None:
+            #         print("Param Group Norm:", param_group, i, torch.norm(self.parameters[param_group][i].grad))
+            #     else:
+            #         print("Param Group Norm:", param_group, i, "None")
             # note that they key is the parameter name
             max_norm = self.config[param_group]["optimizer"].max_norm
             if max_norm is not None:

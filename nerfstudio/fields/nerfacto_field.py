@@ -92,6 +92,7 @@ class NerfactoField(Field):
         pass_semantic_gradients: bool = False,
         use_pred_normals: bool = False,
         use_average_appearance_embedding: bool = False,
+        freeze_view_direction: bool = False,
         spatial_distortion: Optional[SpatialDistortion] = None,
         implementation: Literal["tcnn", "torch"] = "tcnn",
     ) -> None:
@@ -114,6 +115,7 @@ class NerfactoField(Field):
         self.use_pred_normals = use_pred_normals
         self.pass_semantic_gradients = pass_semantic_gradients
         self.base_res = base_res
+        self.freeze_view_direction = freeze_view_direction
 
         self.direction_encoding = SHEncoding(
             levels=4,
@@ -285,9 +287,14 @@ class NerfactoField(Field):
             x = self.mlp_pred_normals(pred_normals_inp).view(*outputs_shape, -1).to(directions)
             outputs[FieldHeadNames.PRED_NORMALS] = self.field_head_pred_normals(x)
 
+        if self.freeze_view_direction:
+            freeze = 0
+        else:
+            freeze = 1
+
         h = torch.cat(
             [
-                d,
+                d * freeze,
                 density_embedding.view(-1, self.geo_feat_dim),
                 embedded_appearance.view(-1, self.appearance_embedding_dim),
             ],
